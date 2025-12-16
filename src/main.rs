@@ -9,7 +9,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::env;
 use std::fs;
@@ -577,7 +577,7 @@ fn run_cs(parts: Vec<String>, model: Option<&str>) -> Result<()> {
 
     print_block("Copilot", trimmed);
 
-    let action = action_picker()?;
+    let action = action_picker(trimmed)?;
     match action {
         Action::Execute => {
             if confirm_execute(trimmed)? {
@@ -647,7 +647,7 @@ fn print_block(label: &str, body: &str) {
     );
 }
 
-fn action_picker() -> Result<Action> {
+fn action_picker(suggestion: &str) -> Result<Action> {
     let mut stdout = io::stdout();
     enable_raw_mode().context("enable raw mode")?;
     execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
@@ -657,6 +657,16 @@ fn action_picker() -> Result<Action> {
     let result: Result<Action> = (|| {
         let mut idx = 0usize;
         let options = [Action::Execute, Action::Copy, Action::Explain, Action::Quit];
+
+        // Show a bounded amount of text so the UI stays readable.
+        let suggestion_lines: Vec<&str> = suggestion.lines().collect();
+        let suggestion_preview = if suggestion_lines.len() > 12 {
+            let mut s = suggestion_lines[..12].join("\n");
+            s.push_str("\n…");
+            s
+        } else {
+            suggestion.to_string()
+        };
 
         let chosen = loop {
             terminal
@@ -669,7 +679,8 @@ fn action_picker() -> Result<Action> {
                     let chunks = Layout::default()
                         .direction(Direction::Vertical)
                         .constraints([
-                            Constraint::Length(3),
+                            Constraint::Length(2),
+                            Constraint::Min(5),
                             Constraint::Length(options.len() as u16 + 2),
                         ])
                         .split(area);
@@ -679,6 +690,11 @@ fn action_picker() -> Result<Action> {
                         Style::default().fg(Color::Gray),
                     )]));
                     f.render_widget(header, chunks[0]);
+
+                    let suggestion_box = Paragraph::new(suggestion_preview.clone())
+                        .block(Block::default().borders(Borders::ALL).title("Suggestion"))
+                        .wrap(Wrap { trim: false });
+                    f.render_widget(suggestion_box, chunks[1]);
 
                     let lines: Vec<Line> = options
                         .iter()
@@ -724,7 +740,7 @@ fn action_picker() -> Result<Action> {
                             .borders(Borders::NONE)
                             .padding(Padding::zero()),
                     );
-                    f.render_widget(list, chunks[1]);
+                    f.render_widget(list, chunks[2]);
                 })
                 .context("draw TUI")?;
 
