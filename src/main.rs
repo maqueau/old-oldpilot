@@ -12,7 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::Terminal;
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 const CS_PREFIX: &str = "[[CPLT:CS]]";
@@ -41,6 +43,8 @@ enum Commands {
     Cs { prompt: Vec<String> },
     /// Suggest a command using the Copilot default model selection
     Csx { prompt: Vec<String> },
+    /// Open an interactive settings menu (writes ~/.config/oldpilot/config)
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +55,488 @@ enum Action {
     Quit,
 }
 
+#[derive(Clone, Debug, Default)]
+struct Config {
+    /// Default model to use when the user runs `ce`/`cs` (overridable by env)
+    default_model: Option<String>,
+    /// Whether to prompt before executing suggested commands (overridable by env)
+    confirm_execute: Option<bool>,
+    /// Which `copilot` binary to execute (overridable by env)
+    copilot_bin: Option<String>,
+    /// Which shell to run commands through (overridable by env)
+    shell: Option<String>,
+}
+
+fn config_path() -> Result<PathBuf> {
+    // Prefer XDG-ish config location
+    if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+        let mut p = PathBuf::from(dir);
+        p.push("oldpilot");
+        p.push("config");
+        return Ok(p);
+    }
+
+    let home = env::var("HOME").context("HOME is not set")?;
+    let mut p = PathBuf::from(home);
+    p.push(".config");
+    p.push("oldpilot");
+    p.push("config");
+    Ok(p)
+}
+
+fn load_config() -> Result<Config> {
+    let path = config_path()?;
+    let data = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(anyhow!(e)).context("failed to read config"),
+    };
+
+    let mut cfg = Config::default();
+    for raw in data.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let mut val = v.trim().to_string();
+        // Allow quoted strings
+        if (val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\''))
+        {
+            if val.len() >= 2 {
+                val = val[1..val.len() - 1].to_string();
+            }
+        }
+
+        match key {
+            "default_model" => {
+                if !val.is_empty() {
+                    cfg.default_model = Some(val);
+                }
+            }
+            "confirm_execute" => {
+                let b = val.eq_ignore_ascii_case("true")
+                    || val == "1"
+                    || val.eq_ignore_ascii_case("yes");
+                let f = val.eq_ignore_ascii_case("false")
+                    || val == "0"
+                    || val.eq_ignore_ascii_case("no");
+                if b {
+                    cfg.confirm_execute = Some(true);
+                }
+                if f {
+                    cfg.confirm_execute = Some(false);
+                }
+            }
+            "copilot_bin" => {
+                if !val.is_empty() {
+                    cfg.copilot_bin = Some(val);
+                }
+            }
+            "shell" => {
+                if !val.is_empty() {
+                    cfg.shell = Some(val);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(cfg)
+}
+
+fn save_config(cfg: &Config) -> Result<()> {
+    let path = config_path()?;
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .context("config path has no parent")?;
+    fs::create_dir_all(&dir).context("failed to create config directory")?;
+
+    let mut out = String::new();
+    out.push_str("# oldpilot config\n");
+    out.push_str("# Lines are key=value. Strings may be quoted.\n\n");
+
+    if let Some(m) = &cfg.default_model {
+        out.push_str(&format!("default_model=\"{}\"\n", m.replace('"', "\\\"")));
+    }
+    if let Some(b) = cfg.confirm_execute {
+        out.push_str(&format!(
+            "confirm_execute={}\n",
+            if b { "true" } else { "false" }
+        ));
+    }
+    if let Some(b) = &cfg.copilot_bin {
+        out.push_str(&format!("copilot_bin=\"{}\"\n", b.replace('"', "\\\"")));
+    }
+    if let Some(s) = &cfg.shell {
+        out.push_str(&format!("shell=\"{}\"\n", s.replace('"', "\\\"")));
+    }
+
+    fs::write(&path, out).context("failed to write config")?;
+    Ok(())
+}
+
+fn cfg_string_display(v: &Option<String>, fallback: &str) -> String {
+    v.as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn cfg_bool_display(v: Option<bool>, fallback: bool) -> String {
+    match v {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
+        None => if fallback { "true" } else { "false" }.to_string(),
+    }
+}
+
+fn resolve_default_model(cfg: &Config) -> String {
+    // env wins, then config, then DEFAULT_MODEL
+    if let Ok(v) = env::var("COPILOT_DEFAULT_MODEL") {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    cfg.default_model
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
+
+fn resolve_confirm_execute(cfg: &Config) -> bool {
+    // env wins, then config, then true
+    if let Ok(v) = env::var("COPILOT_CS_CONFIRM_EXECUTE") {
+        if v.eq_ignore_ascii_case("false") || v == "0" || v.eq_ignore_ascii_case("no") {
+            return false;
+        }
+        if v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes") {
+            return true;
+        }
+    }
+    cfg.confirm_execute.unwrap_or(true)
+}
+
+fn resolve_copilot_bin(cfg: &Config) -> String {
+    if let Ok(v) = env::var("COPILOT_BIN") {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    cfg.copilot_bin
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "copilot".to_string())
+}
+
+fn resolve_shell(cfg: &Config) -> String {
+    if let Ok(v) = env::var("COPILOT_SHELL") {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    cfg.shell
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "sh".to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsField {
+    DefaultModel,
+    ConfirmExecute,
+    CopilotBin,
+    Shell,
+    Save,
+    Quit,
+}
+
+fn run_settings() -> Result<()> {
+    let mut cfg = load_config()?;
+
+    let mut stdout = io::stdout();
+    enable_raw_mode().context("enable raw mode")?;
+    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    let result: Result<()> = (|| {
+        let fields = [
+            SettingsField::DefaultModel,
+            SettingsField::ConfirmExecute,
+            SettingsField::CopilotBin,
+            SettingsField::Shell,
+            SettingsField::Save,
+            SettingsField::Quit,
+        ];
+
+        let mut idx = 0usize;
+        let mut status_line = String::from("↑/↓ move · Enter edit/toggle · s save · q quit");
+
+        // Inline editor state
+        let mut editing: Option<SettingsField> = None;
+        let mut edit_buf = String::new();
+
+        loop {
+            terminal
+                .draw(|f| {
+                    let area = f.size().inner(&Margin {
+                        horizontal: 2,
+                        vertical: 1,
+                    });
+
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(3),
+                            Constraint::Min(6),
+                            Constraint::Length(2),
+                        ])
+                        .split(area);
+
+                    let title = Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            "oldpilot settings",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("(config: {})", config_path().unwrap_or_default().display()),
+                            Style::default().fg(Color::Gray),
+                        ),
+                    ]));
+                    f.render_widget(title, chunks[0]);
+
+                    let effective_model = resolve_default_model(&cfg);
+                    let effective_confirm = resolve_confirm_execute(&cfg);
+                    let effective_bin = resolve_copilot_bin(&cfg);
+                    let effective_shell = resolve_shell(&cfg);
+
+                    let lines: Vec<Line> = fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, field)| {
+                            let selected = i == idx;
+                            let base_style = if selected {
+                                Style::default()
+                                    .fg(Color::Green)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default()
+                            };
+
+                            let (label, value, hint) = match field {
+                                SettingsField::DefaultModel => (
+                                    "Default model",
+                                    cfg_string_display(&cfg.default_model, &effective_model),
+                                    "string",
+                                ),
+                                SettingsField::ConfirmExecute => (
+                                    "Confirm execute",
+                                    cfg_bool_display(cfg.confirm_execute, effective_confirm),
+                                    "toggle",
+                                ),
+                                SettingsField::CopilotBin => (
+                                    "Copilot binary",
+                                    cfg_string_display(&cfg.copilot_bin, &effective_bin),
+                                    "string",
+                                ),
+                                SettingsField::Shell => (
+                                    "Shell",
+                                    cfg_string_display(&cfg.shell, &effective_shell),
+                                    "string",
+                                ),
+                                SettingsField::Save => ("Save", String::new(), "s"),
+                                SettingsField::Quit => ("Quit", String::new(), "q"),
+                            };
+
+                            let is_editing = editing.is_some() && editing.unwrap() == *field;
+
+                            let value_for_render = if is_editing {
+                                edit_buf.clone()
+                            } else {
+                                value.clone()
+                            };
+
+                            let value_span = if is_editing {
+                                Span::styled(
+                                    value_for_render.clone(),
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD),
+                                )
+                            } else {
+                                Span::styled(
+                                    value_for_render.clone(),
+                                    Style::default().fg(Color::Gray),
+                                )
+                            };
+
+                            let left = if selected { " > " } else { "   " };
+
+                            // Format: label  value  (hint)
+                            let mut spans = vec![Span::raw(left), Span::styled(label, base_style)];
+
+                            if !value_for_render.is_empty() {
+                                spans.push(Span::raw("  "));
+                                spans.push(value_span);
+                            }
+
+                            spans.push(Span::raw("  "));
+                            spans.push(Span::styled(
+                                format!("({})", hint),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+
+                            Line::from(spans)
+                        })
+                        .collect();
+
+                    let list = Paragraph::new(lines).block(
+                        Block::default()
+                            .borders(Borders::NONE)
+                            .padding(Padding::zero()),
+                    );
+                    f.render_widget(list, chunks[1]);
+
+                    let status = Paragraph::new(Line::from(Span::styled(
+                        status_line.clone(),
+                        Style::default().fg(Color::Gray),
+                    )));
+                    f.render_widget(status, chunks[2]);
+                })
+                .context("draw settings TUI")?;
+
+            if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    // If we're editing a string field, capture text input.
+                    if let Some(field) = editing {
+                        match key.code {
+                            KeyCode::Esc => {
+                                editing = None;
+                                edit_buf.clear();
+                                status_line = "edit canceled".to_string();
+                            }
+                            KeyCode::Enter => {
+                                let new_val = edit_buf.trim().to_string();
+                                match field {
+                                    SettingsField::DefaultModel => {
+                                        cfg.default_model = if new_val.is_empty() {
+                                            None
+                                        } else {
+                                            Some(new_val)
+                                        };
+                                    }
+                                    SettingsField::CopilotBin => {
+                                        cfg.copilot_bin = if new_val.is_empty() {
+                                            None
+                                        } else {
+                                            Some(new_val)
+                                        };
+                                    }
+                                    SettingsField::Shell => {
+                                        cfg.shell = if new_val.is_empty() {
+                                            None
+                                        } else {
+                                            Some(new_val)
+                                        };
+                                    }
+                                    _ => {}
+                                }
+                                editing = None;
+                                edit_buf.clear();
+                                status_line = "updated (press s to save)".to_string();
+                            }
+                            KeyCode::Backspace => {
+                                edit_buf.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                // Basic guard: avoid control chars
+                                if !c.is_control() {
+                                    edit_buf.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    match key.code {
+                        KeyCode::Up => {
+                            if idx == 0 {
+                                idx = fields.len() - 1;
+                            } else {
+                                idx -= 1;
+                            }
+                        }
+                        KeyCode::Down => {
+                            idx = (idx + 1) % fields.len();
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            break;
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S') => {
+                            save_config(&cfg)?;
+                            status_line = "saved".to_string();
+                        }
+                        KeyCode::Enter => match fields[idx] {
+                            SettingsField::ConfirmExecute => {
+                                let current =
+                                    cfg.confirm_execute.unwrap_or(resolve_confirm_execute(&cfg));
+                                cfg.confirm_execute = Some(!current);
+                                status_line = "toggled (press s to save)".to_string();
+                            }
+                            SettingsField::DefaultModel => {
+                                editing = Some(SettingsField::DefaultModel);
+                                edit_buf = cfg.default_model.clone().unwrap_or_default();
+                                status_line =
+                                    "editing default_model (Enter to apply, Esc to cancel)"
+                                        .to_string();
+                            }
+                            SettingsField::CopilotBin => {
+                                editing = Some(SettingsField::CopilotBin);
+                                edit_buf = cfg.copilot_bin.clone().unwrap_or_default();
+                                status_line = "editing copilot_bin (Enter to apply, Esc to cancel)"
+                                    .to_string();
+                            }
+                            SettingsField::Shell => {
+                                editing = Some(SettingsField::Shell);
+                                edit_buf = cfg.shell.clone().unwrap_or_default();
+                                status_line =
+                                    "editing shell (Enter to apply, Esc to cancel)".to_string();
+                            }
+                            SettingsField::Save => {
+                                save_config(&cfg)?;
+                                status_line = "saved".to_string();
+                            }
+                            SettingsField::Quit => {
+                                break;
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    })();
+
+    cleanup_terminal(&mut terminal)?;
+    result
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -59,6 +545,7 @@ fn main() -> Result<()> {
         Commands::Cex { prompt } => run_ce(prompt, None),
         Commands::Cs { prompt } => run_cs(prompt, Some(default_model()?.as_str())),
         Commands::Csx { prompt } => run_cs(prompt, None),
+        Commands::Settings => run_settings(),
     }
 }
 
@@ -116,11 +603,14 @@ fn run_cs(parts: Vec<String>, model: Option<&str>) -> Result<()> {
 }
 
 fn default_model() -> Result<String> {
-    Ok(env::var("COPILOT_DEFAULT_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()))
+    let cfg = load_config().unwrap_or_default();
+    Ok(resolve_default_model(&cfg))
 }
 
 fn copilot_prompt(prompt_text: &str, model: Option<&str>) -> Result<String> {
-    let mut cmd = Command::new("copilot");
+    let cfg = load_config().unwrap_or_default();
+    let copilot_bin = resolve_copilot_bin(&cfg);
+    let mut cmd = Command::new(copilot_bin);
     cmd.arg("-p").arg(prompt_text).arg("-s");
     if let Some(m) = model {
         if !m.is_empty() {
@@ -278,9 +768,8 @@ fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 }
 
 fn confirm_execute(_cmd: &str) -> Result<bool> {
-    let confirm_flag =
-        env::var("COPILOT_CS_CONFIRM_EXECUTE").unwrap_or_else(|_| "true".to_string());
-    if confirm_flag.eq_ignore_ascii_case("false") {
+    let cfg = load_config().unwrap_or_default();
+    if !resolve_confirm_execute(&cfg) {
         return Ok(true);
     }
 
@@ -293,7 +782,10 @@ fn confirm_execute(_cmd: &str) -> Result<bool> {
 }
 
 fn run_shell(cmd: &str) -> Result<()> {
-    let status = Command::new("sh")
+    let cfg = load_config().unwrap_or_default();
+    let shell = resolve_shell(&cfg);
+
+    let status = Command::new(shell)
         .arg("-c")
         .arg(cmd)
         .status()
