@@ -1,13 +1,18 @@
-TODO
+# TODO
 
-Since the Copilot CLI is installed via global npm, your wrapper should:
-• call command -v copilot at runtime
-• if missing, print a friendly error telling them to install it (npm i -g ... or whatever the official install is)
+## Completed on `todo-implementation`
 
-Change the 'confirm execution' to be something you can just press y without enter.
+- [x] Add a `doctor` subcommand that reports Copilot, clipboard, and terminal status.
+- [x] Add a friendly missing-Copilot installation hint.
+- [x] Add basic tests for confirmation parsing and command lookup.
+- [x] Add initial usage and configuration documentation in `README.md`.
 
-• Add a copilot-wrapper doctor command that checks:
-• copilot exists
-• clipboard tools exist
-• terminal is interactive
-• prints fixes
+## Remaining implementation work
+
+- [ ] Resolve the Copilot binary once through a shared path-resolution routine and make both normal execution and `doctor` honor `COPILOT_BIN`, `copilot_bin`, and explicit paths consistently.
+- [ ] Implement confirmation with Crossterm raw-mode key events so `y` works without Enter; always restore terminal state on success and error paths.
+- [ ] Make `doctor` test clipboard capability using the same `arboard`-first behavior as the copy action, and return a nonzero status when required checks fail.
+- [ ] Make `doctor` check the configured shell as well as Copilot and clipboard support.
+- [ ] Add deterministic tests for configuration precedence, binary resolution, doctor status, and failure cases without requiring a real Copilot installation or interactive terminal.
+- [ ] Verify the current official Copilot CLI installation instructions and keep the README/error hint aligned with them.
+- [ ] Review command execution and terminal cleanup for interruption/error paths.
