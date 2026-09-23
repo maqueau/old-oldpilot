@@ -13,13 +13,14 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const CS_PREFIX: &str = "[[CPLT:CS]]";
 const CE_PREFIX: &str = "[[CPLT:CE]]";
 const DEFAULT_MODEL: &str = "gpt-4.1";
+const COPILOT_INSTALL_HINT: &str = "npm install -g @github/copilot";
 
 #[derive(Parser)]
 #[command(
@@ -45,6 +46,8 @@ enum Commands {
     Csx { prompt: Vec<String> },
     /// Open an interactive settings menu (writes ~/.config/oldpilot/config)
     Settings,
+    /// Check runtime dependencies and print fixes
+    Doctor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +70,14 @@ struct Config {
     shell: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DoctorReport {
+    copilot_found: bool,
+    clipboard_found: bool,
+    terminal_interactive: bool,
+    copilot_path: Option<String>,
+}
+
 fn config_path() -> Result<PathBuf> {
     // Prefer XDG-ish config location
     if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
@@ -82,6 +93,65 @@ fn config_path() -> Result<PathBuf> {
     p.push("oldpilot");
     p.push("config");
     Ok(p)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn command_exists(name: &str) -> bool {
+    let shell = if cfg!(windows) { "cmd" } else { "sh" };
+    let status = if cfg!(windows) {
+        Command::new(shell)
+            .arg("/C")
+            .arg(format!("where {} >nul 2>&1", name))
+            .status()
+    } else {
+        Command::new(shell)
+            .arg("-lc")
+            .arg(format!("command -v -- {} >/dev/null 2>&1", shell_quote(name)))
+            .status()
+    };
+
+    matches!(status, Ok(code) if code.success())
+}
+
+fn resolve_copilot_bin_path(cfg: &Config) -> Result<PathBuf> {
+    let candidate = resolve_copilot_bin(cfg);
+    let candidate_path = Path::new(&candidate);
+
+    if candidate_path.is_absolute() || candidate.contains('/') || candidate.contains('\\') {
+        if candidate_path.is_file() {
+            return Ok(candidate_path.to_path_buf());
+        }
+        return Err(anyhow!(
+            "The configured GitHub Copilot CLI binary '{}' does not exist or is not executable. Install it with `{} `and verify it is on your PATH.",
+            candidate,
+            COPILOT_INSTALL_HINT
+        ));
+    }
+
+    let output = Command::new("sh")
+        .arg("-lc")
+        .arg(format!(
+            "command -v -- {} >/dev/null 2>&1 && command -v -- {}",
+            shell_quote(&candidate),
+            shell_quote(&candidate)
+        ))
+        .output()
+        .context("failed to locate the Copilot CLI on PATH")?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    Err(anyhow!(
+        "GitHub Copilot CLI is not installed or not on PATH. Install it with `{}` and then run `command -v copilot` to verify it is available.",
+        COPILOT_INSTALL_HINT
+    ))
 }
 
 fn load_config() -> Result<Config> {
@@ -537,6 +607,77 @@ fn run_settings() -> Result<()> {
     result
 }
 
+fn doctor_report() -> DoctorReport {
+    let copilot_path = match command_exists("copilot") {
+        true => {
+            let output = Command::new("sh")
+                .arg("-lc")
+                .arg("command -v -- 'copilot'")
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if value.is_empty() { None } else { Some(value) }
+                }
+                _ => None,
+            }
+        }
+        false => None,
+    };
+
+    let clipboard_found = ["pbcopy", "wl-copy", "xclip"]
+        .iter()
+        .any(|tool| command_exists(tool));
+
+    let terminal_interactive = io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal();
+
+    DoctorReport {
+        copilot_found: copilot_path.is_some(),
+        clipboard_found,
+        terminal_interactive,
+        copilot_path,
+    }
+}
+
+fn run_doctor() -> Result<()> {
+    let report = doctor_report();
+    println!("oldpilot doctor");
+    println!(
+        "  copilot: {}{}",
+        if report.copilot_found { "OK" } else { "MISSING" },
+        if let Some(path) = &report.copilot_path {
+            format!(" ({})", path)
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "  clipboard: {}",
+        if report.clipboard_found { "OK" } else { "MISSING" }
+    );
+    println!(
+        "  terminal: {}",
+        if report.terminal_interactive { "interactive" } else { "non-interactive" }
+    );
+
+    if !report.copilot_found {
+        println!("  fix: install GitHub Copilot CLI with `{}`", COPILOT_INSTALL_HINT);
+    }
+    if !report.clipboard_found {
+        println!("  fix: install one of `pbcopy` (macOS), `wl-copy` (Wayland), or `xclip` (X11)");
+    }
+    if !report.terminal_interactive {
+        println!("  fix: run this command from an interactive terminal session");
+    }
+    if report.copilot_found && report.clipboard_found && report.terminal_interactive {
+        println!("  status: all checks passed");
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -546,6 +687,7 @@ fn main() -> Result<()> {
         Commands::Cs { prompt } => run_cs(prompt, Some(default_model()?.as_str())),
         Commands::Csx { prompt } => run_cs(prompt, None),
         Commands::Settings => run_settings(),
+        Commands::Doctor => run_doctor(),
     }
 }
 
@@ -609,8 +751,8 @@ fn default_model() -> Result<String> {
 
 fn copilot_prompt(prompt_text: &str, model: Option<&str>) -> Result<String> {
     let cfg = load_config().unwrap_or_default();
-    let copilot_bin = resolve_copilot_bin(&cfg);
-    let mut cmd = Command::new(copilot_bin);
+    let bin_path = resolve_copilot_bin_path(&cfg)?;
+    let mut cmd = Command::new(bin_path);
     cmd.arg("-p").arg(prompt_text).arg("-s");
     if let Some(m) = model {
         if !m.is_empty() {
@@ -783,18 +925,42 @@ fn cleanup_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     Ok(())
 }
 
+fn parse_confirmation(input: &str) -> bool {
+    let trimmed = input.trim();
+    matches!(trimmed.to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 fn confirm_execute(_cmd: &str) -> Result<bool> {
     let cfg = load_config().unwrap_or_default();
     if !resolve_confirm_execute(&cfg) {
         return Ok(true);
     }
 
-    print!("Confirm execution: [y/N] ");
-    io::stdout().flush().ok();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).ok();
-    let trimmed = input.trim();
-    Ok(trimmed.eq_ignore_ascii_case("y"))
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(false);
+    }
+
+    print!("Confirm execution? [y/N]: ");
+    io::stdout().flush()?;
+
+    let mut stdin = io::stdin();
+    let mut byte = [0u8; 1];
+    let read = stdin.read(&mut byte);
+    match read {
+        Ok(0) => {
+            println!();
+            return Ok(false);
+        }
+        Ok(_) => {
+            let c = byte[0] as char;
+            println!();
+            return Ok(parse_confirmation(&c.to_string()));
+        }
+        Err(_) => {
+            println!();
+            return Ok(false);
+        }
+    }
 }
 
 fn run_shell(cmd: &str) -> Result<()> {
@@ -869,3 +1035,24 @@ impl Colors {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{command_exists, parse_confirmation};
+
+    #[test]
+    fn confirm_parser_accepts_yes() {
+        assert!(parse_confirmation("y"));
+        assert!(parse_confirmation("Y"));
+        assert!(parse_confirmation("yes"));
+        assert!(parse_confirmation(" YES "));
+        assert!(!parse_confirmation("n"));
+        assert!(!parse_confirmation(""));
+    }
+
+    #[test]
+    fn lookup_for_shell_is_available() {
+        assert!(command_exists("sh"), "expected sh to be available on PATH");
+    }
+}
+
